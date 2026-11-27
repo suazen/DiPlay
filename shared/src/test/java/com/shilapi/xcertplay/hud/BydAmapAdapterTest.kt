@@ -31,14 +31,19 @@ class BydAmapAdapterTest {
 
     @Test
     fun clusterModeUsesClusterDebugCommands() {
-        assertEquals("service call AutoContainer 2 i32 1000 i32 39 s16 \"\"", BydDiLink3ClusterMode.Mode.SIMPLE_NAVIGATION.command)
-        assertEquals("service call AutoContainer 2 i32 1000 i32 16 s16 \"\"", BydDiLink3ClusterMode.Mode.PROJECTION.entryCommand)
-        assertEquals("service call AutoContainer 2 i32 1000 i32 17 s16 \"\"", BydDiLink3ClusterMode.Mode.PROJECTION.command)
+        assertEquals(clusterCommand(39), BydDiLink3ClusterMode.Mode.SIMPLE_NAVIGATION.command)
+        assertEquals(clusterCommand(16), BydDiLink3ClusterMode.Mode.PROJECTION.entryCommand)
+        assertEquals(clusterCommand(17), BydDiLink3ClusterMode.Mode.PROJECTION.command)
         // Full screen needs no entry command: 16 is the projection itself, not a way into 17.
         assertNull(BydDiLink3ClusterMode.Mode.FULL_PROJECTION.entryCommand)
-        assertEquals("service call AutoContainer 2 i32 1000 i32 16 s16 \"\"", BydDiLink3ClusterMode.Mode.FULL_PROJECTION.command)
-        assertEquals("service call AutoContainer 2 i32 1000 i32 18 s16 \"\"", BydDiLink3ClusterMode.Mode.STOCK.command)
+        assertEquals(clusterCommand(16), BydDiLink3ClusterMode.Mode.FULL_PROJECTION.command)
+        assertEquals(clusterCommand(18), BydDiLink3ClusterMode.Mode.STOCK.command)
     }
+
+    /** Newer builds register the binder as `auto_container`; older ones as `AutoContainer`. */
+    private fun clusterCommand(info: Int) =
+        "service call auto_container 2 i32 1000 i32 $info s16 \"\" || " +
+            "service call AutoContainer 2 i32 1000 i32 $info s16 \"\""
 
     @Test
     fun theChosenProjectionShapeIsRequestedWhileTheMapIsShown() {
@@ -93,7 +98,7 @@ class BydAmapAdapterTest {
     @Test
     fun displayIsCreatedAsDashCastDoesAndLeftInTheStockView() {
         assertEquals(
-            listOf(16, 35, 18).map { "service call AutoContainer 2 i32 1000 i32 $it s16 \"\"" },
+            listOf(16, 35, 18).map(::clusterCommand),
             BydDiLink3ClusterMode.CREATE_DISPLAY,
         )
     }
