@@ -467,12 +467,16 @@ open class CarPlayHostActivity : ComponentActivity() {
     private val currentSurface: Surface? get() = videoSurfaceOwner.current
     private var currentSurfaceTexture: SurfaceTexture? = null
     private var clusterPresentation: ClusterMapPresentation? = null
+    /** Transparent right-column instruction card; only the card is visible, never a full screen. */
+    private var floatingTurnCard: ClusterTurnCardPresentation? = null
     private var clusterSurface: Surface? = null
     private var clusterMonitor: DiLink51ClusterMonitor? = null
     private var detectedCluster = ClusterActivityState.Snapshot(null, false)
     // Keep one surface per layer alive, including while its map card is hidden.
     private val clusterLayers = mutableMapOf<Boolean, ClusterMapPresentation>()
     private var clusterTurnGuidance: com.shilapi.xcertplay.hud.ClusterTurnGuidance? = null
+    /** Latest iAP2 0x5204 lane strip; empty when the phone clears it. */
+    private var clusterLanes: List<com.shilapi.xcertplay.iap2.message.LaneGuidanceLane> = emptyList()
     private val clusterTurnOverlayListener: (com.shilapi.xcertplay.hud.ClusterTurnGuidance?) -> Unit = { guidance ->
         runOnUiThread {
             clusterTurnGuidance = guidance
@@ -793,6 +797,23 @@ open class CarPlayHostActivity : ComponentActivity() {
         override fun run() {
             refreshConfiguration(source = ThemeModeDiagnostics.Source.POLL)
             mainHandler.postDelayed(this, CONFIGURATION_POLL_INTERVAL_MILLIS)
+        }
+    }
+    /**
+     * BYD does not drive Android's night mode from the car setting, so read the head unit's own
+     * day/night state on a worker and let "follow system" use it instead of a stuck uiMode.
+     */
+    private val pollCarDayNight = object : Runnable {
+        override fun run() {
+            if (isFinishing || isDestroyed) return
+            val app = applicationContext
+            Thread({
+                val night = com.shilapi.xcertplay.hud.BydDayNight.refresh(app)
+                if (night != null && !isFinishing && !isDestroyed) {
+                    runOnUiThread { nightModeController.systemChanged(night) }
+                }
+            }, "diplay-car-daynight").start()
+            mainHandler.postDelayed(this, CAR_DAY_NIGHT_POLL_MILLIS)
         }
     }
     private val applyDisplaySize = Runnable {
@@ -1235,6 +1256,8 @@ open class CarPlayHostActivity : ComponentActivity() {
         logThemeState(ThemeModeDiagnostics.Source.START, resources.configuration)
         mainHandler.removeCallbacks(pollConfiguration)
         mainHandler.post(pollConfiguration)
+        mainHandler.removeCallbacks(pollCarDayNight)
+        mainHandler.post(pollCarDayNight)
         CenterMapOverlay.onDiPlayScreenShown()
         LauncherBubble.attach(this)
         LauncherBubble.onAppScreenShown()
@@ -1254,7 +1277,9 @@ open class CarPlayHostActivity : ComponentActivity() {
         val savedThreshold = AirPlayPersistence.loadAmbientLightThreshold(this)
         val savedDelay = AirPlayPersistence.loadAmbientDelaySeconds(this)
         val savedSchedule = AirPlayPersistence.loadCarPlayNightSchedule(this)
-        val systemNight = nightModeOrNull(resources.configuration.uiMode) ?: false
+        // The car's own day/night wins over a uiMode the head unit never switches.
+        val systemNight = com.shilapi.xcertplay.hud.BydDayNight.night
+            ?: nightModeOrNull(resources.configuration.uiMode) ?: false
         if (savedNightMode != carPlayNightMode || savedThreshold != ambientLightThreshold ||
             savedDelay != ambientDelaySeconds || savedSchedule != nightSchedule) {
             carPlayNightMode = savedNightMode
@@ -1316,6 +1341,12 @@ open class CarPlayHostActivity : ComponentActivity() {
         ensureClusterPresentation()
         AirPlayPersistence.overlaySettingsListener = { runOnUiThread { applyClusterTurnOverlay() } }
         com.shilapi.xcertplay.hud.BydNavigationOutputs.setTurnOverlayListener(clusterTurnOverlayListener)
+        com.shilapi.xcertplay.glance.CarPlayGlance.laneListener = { lanes ->
+            runOnUiThread {
+                clusterLanes = lanes
+                applyClusterTurnOverlay()
+            }
+        }
         mainHandler.removeCallbacks(refreshTurnOverlay)
         mainHandler.post(refreshTurnOverlay)
         var systemBarsChanged = false
@@ -1560,16 +1591,71 @@ open class CarPlayHostActivity : ComponentActivity() {
         else AirPlayPersistence.loadClusterTurnCardOpacityPercent(this)
         ClusterActivityOutput.setTurnCard(if (overlay) clusterTurnGuidance else null,
             xPercent, yPercent, sizePercent, effectiveOpacity, effectiveNight)
+        val floatingEnabled = com.shilapi.xcertplay.hud.BydOutputSettings.enabled(this)
         val presentations = (clusterLayers.values + listOfNotNull(clusterPresentation)).distinct()
         for (presentation in presentations) {
             presentation.setTurnCardOverlay(xPercent, yPercent, sizePercent)
             presentation.setTurnCardOpacity(effectiveOpacity)
             presentation.setTurnCardNightMode(effectiveNight)
-            presentation.setTurnCardGuidance(if (overlay) clusterTurnGuidance else null)
+            // The floating card owns the instruction card while the output switch is on; drawing it
+            // here too would show two cards and make them appear to flicker.
+            presentation.setTurnCardGuidance(if (overlay && !floatingEnabled) clusterTurnGuidance else null)
         }
+        applyFloatingTurnCard()
+    }
+
+    /**
+     * The stock simple-navigation card sits in the cluster's right column. Draw DiPlay's instruction
+     * card there on a transparent, non-touchable presentation, so the cluster keeps its own screen.
+     *
+     * The window is created with the first maneuver and then kept for the session: dismissing and
+     * re-showing it on every guidance or route change makes the card visibly blink. Only the card
+     * view is hidden when there is no instruction.
+     */
+    private fun applyFloatingTurnCard() {
+        if (!com.shilapi.xcertplay.hud.BydOutputSettings.enabled(this)) {
+            floatingTurnCard?.let {
+                runCatching { it.dismiss() }
+                Log.i(TAG, "floating turn card dismissed: switch off")
+            }
+            floatingTurnCard = null
+            return
+        }
+        val display = ClusterMapPresentation.findDisplay(this)
+        if (display == null) {
+            floatingTurnCard?.let {
+                runCatching { it.dismiss() }
+                Log.i(TAG, "floating turn card dismissed: no cluster display")
+            }
+            floatingTurnCard = null
+            return
+        }
+        val presentation = floatingTurnCard ?: run {
+            if (clusterTurnGuidance == null) return
+            ClusterTurnCardPresentation(this, display).also { created ->
+                floatingTurnCard = created
+                runCatching { created.show() }.onFailure { error ->
+                    floatingTurnCard = null
+                    Log.w(TAG, "floating turn card failed: ${error.javaClass.simpleName}")
+                }
+            }
+        }
+        if (!presentation.isShowing) return
+        // The stock simple-navigation card sits in the right column; keep the floating card there.
+        presentation.setTurnCardOverlay(
+            FLOATING_CARD_X_PERCENT,
+            FLOATING_CARD_Y_PERCENT,
+            FLOATING_CARD_SIZE_PERCENT,
+        )
+        presentation.setTurnCardOpacity(AirPlayPersistence.loadClusterTurnCardOpacityPercent(this))
+        presentation.setTurnCardNightMode(darkMode)
+        presentation.setTurnCardLanes(clusterLanes)
+        presentation.setTurnCardGuidance(clusterTurnGuidance)
     }
     private fun dismissClusterPresentation() {
         ClusterActivityOutput.stop(this)
+        // The floating instruction card is independent of the CarPlay cluster map: the map is
+        // disabled or released on many ticks, and tearing the card down with it made it blink.
         val presentations = (clusterLayers.values + listOfNotNull(clusterPresentation)).distinct()
         clusterLayers.clear()
         clusterPresentation = null
@@ -1921,6 +2007,7 @@ open class CarPlayHostActivity : ComponentActivity() {
         isActivityStarted = false
         logThemeState(ThemeModeDiagnostics.Source.STOP, resources.configuration)
         mainHandler.removeCallbacks(pollConfiguration)
+        mainHandler.removeCallbacks(pollCarDayNight)
         super.onStop()
         // Off screen there are no system bars to hide, so a launch waiting for focus can go now.
         onClusterLaunchTick()
@@ -2049,6 +2136,7 @@ open class CarPlayHostActivity : ComponentActivity() {
         delayedDoubleSiri = null
         AirPlayPersistence.overlaySettingsListener = null
         com.shilapi.xcertplay.hud.BydNavigationOutputs.setTurnOverlayListener(null)
+        com.shilapi.xcertplay.glance.CarPlayGlance.laneListener = null
         com.shilapi.xcertplay.hud.BydNavigationOutputs.setClusterNaviModeListener(null)
         clusterMonitor?.stop()
         getSystemService(android.hardware.display.DisplayManager::class.java)
@@ -2065,12 +2153,15 @@ open class CarPlayHostActivity : ComponentActivity() {
         if (MapMirrors.onChanged === mirrorsChanged) MapMirrors.onChanged = null
         stopPlayerSettings?.invoke(); stopPlayerSettings = null
         dismissClusterPresentation()
+        floatingTurnCard?.let { runCatching { it.dismiss() } }
+        floatingTurnCard = null
         mainHandler.removeCallbacks(applyDisplaySize)
         mainHandler.removeCallbacks(recheckSizeAfterVideoPlayer)
         videoPlayerSettling = false
         videoPlayerHeldSize = false
         mainHandler.removeCallbacks(expireOldLogLines)
         mainHandler.removeCallbacks(pollConfiguration)
+        mainHandler.removeCallbacks(pollCarDayNight)
         videoSurfaceOwner.clear()
         currentSurfaceTexture = null
         fallbackVideoView = null
@@ -5204,7 +5295,11 @@ open class CarPlayHostActivity : ComponentActivity() {
             mainBufferedAudio = AirPlayPersistence.loadMainBufferedAudio(this),
             speechWithout8And16Khz = AirPlayPersistence.loadSpeechWithout8And16Khz(this),
             callAtCallRate = AirPlayPersistence.loadCallAtCallRate(this),
-            declareAutomaticAppearance = AirPlayPersistence.loadDeclareAutomaticAppearance(this),
+            // When DiPlay can read the car's own day/night, keep CarPlay's appearance under DiPlay's
+            // control: declaring "automatic" lets the iPhone pick from its own sensor, so the
+            // day/night setting (now following the car) had no visible effect (#1159).
+            declareAutomaticAppearance = AirPlayPersistence.loadDeclareAutomaticAppearance(this) &&
+                com.shilapi.xcertplay.hud.BydDayNight.night == null,
             disableAudioOutput = carBluetoothAudio,
             mediaSeekKeys = AirPlayPersistence.loadWheelLongPressSeek(this),
         )
@@ -5881,7 +5976,9 @@ open class CarPlayHostActivity : ComponentActivity() {
         lastConfiguration = Configuration(newConfig)
         nightModeDiagnosticSource = source
         try {
-            nightModeOrNull(newConfig.uiMode)?.let { nightModeController.systemChanged(it) }
+            nightModeOrNull(newConfig.uiMode)?.let {
+                nightModeController.systemChanged(com.shilapi.xcertplay.hud.BydDayNight.night ?: it)
+            }
         } finally {
             nightModeDiagnosticSource = ThemeModeDiagnostics.Source.CARPLAY_MODE
         }
@@ -7192,6 +7289,10 @@ open class CarPlayHostActivity : ComponentActivity() {
     private companion object {
         const val CLUSTER_SMALL_WINDOW_ON = 1
         const val CLUSTER_SMALL_WINDOW_AUTO = 2
+        /** Floating instruction card: the stock simple-navigation column on the right of the panel. */
+        const val FLOATING_CARD_X_PERCENT = 90
+        const val FLOATING_CARD_Y_PERCENT = 50
+        const val FLOATING_CARD_SIZE_PERCENT = 95
         const val SIDE_PANEL_REFRESH_MILLIS = 5_000L
         /** CarPlay's share past which letting go of the panel edge closes the panel: halfway from two thirds to all. */
         const val SIDE_PANEL_CLOSE_SHARE = 5f / 6f
@@ -7216,6 +7317,8 @@ open class CarPlayHostActivity : ComponentActivity() {
         /** After the video player closes, how long the bars it hid may take to come back (0.55 s in #1180). */
         const val VIDEO_PLAYER_SETTLE_MILLIS = 1_500L
         const val CONFIGURATION_POLL_INTERVAL_MILLIS = 2_000L
+        /** The car's day/night changes at most at dusk/dawn; one read a minute is plenty. */
+        const val CAR_DAY_NIGHT_POLL_MILLIS = 60_000L
         const val RECONNECT_DELAY_MILLIS = 2_000L
         const val IAP_TUNNEL_RECONNECT_DELAY_MILLIS = 15_000L
         const val CONTROLLER_CLOSE_TIMEOUT_MILLIS = 4_000L

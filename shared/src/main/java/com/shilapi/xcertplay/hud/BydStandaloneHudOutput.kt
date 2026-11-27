@@ -63,24 +63,46 @@ internal class BydStandaloneHudOutput private constructor(context: Context) {
             }.onFailure { appendLine("receiverMetadataUnavailable=${it.javaClass.simpleName}") }
         }
 
-        /** Enable production and diagnostic packages only on the physically tested firmware. */
+        /** Firmware whose stock receiver protocol was physically verified, with its exact receipt. */
+        private val VERIFIED_FINGERPRINTS = setOf(
+            "BYD-AUTO/IVI/IVI:13/TP1A.220624.014/eng.build20260722.221155:user/release-keys",
+        )
+
+        /**
+         * Additional firmware that ships the same stock receiver. The packet protocol belongs to the
+         * receiver, so these are accepted while it is still a system receiver, exported and
+         * unprotected. The exact version and signing certificate are required only on the firmware
+         * where they were verified.
+         */
+        private val COMPATIBLE_FINGERPRINTS = VERIFIED_FINGERPRINTS + setOf(
+            // DiLink 5.0 (Android 12), OCEAN / Di100VCP_IVI.
+            "OCEAN/Di100VCP_IVI/Di100VCP_IVI:12/SKQ1.230128.001/eng.build.20260830.020849:user/release-keys",
+        )
+
+        /** Enable production and diagnostic packages on firmware that ships the stock receiver. */
         fun available(context: Context): Boolean {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
             if (context.packageName !in setOf(
                     "com.andrerinas.headunitrevived", "com.shihab.diplay",
                     "com.andrerinas.headunitrevived.bydhudtest", "com.shihab.diplay.hudtest")) return false
-            if (Build.FINGERPRINT != "BYD-AUTO/IVI/IVI:13/TP1A.220624.014/eng.build20260722.221155:user/release-keys") return false
+            if (Build.FINGERPRINT !in COMPATIBLE_FINGERPRINTS) return false
             return runCatching {
                 val manager = context.packageManager
                 val info = manager.getPackageInfo(TARGET.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
                 val receiver = manager.getReceiverInfo(TARGET, 0)
+                val receiverOk = ((info.applicationInfo?.flags ?: 0) and ApplicationInfo.FLAG_SYSTEM) != 0 &&
+                    receiver.enabled && receiver.exported && receiver.permission.isNullOrEmpty()
+                if (!receiverOk) return false
+                if (Build.FINGERPRINT !in VERIFIED_FINGERPRINTS) {
+                    Log.w(TAG, "Standalone receiver accepted on compatible firmware " +
+                        "${Build.FINGERPRINT} version=${info.longVersionCode}")
+                    return true
+                }
                 val signers = info.signingInfo?.apkContentsSigners ?: return false
-                info.longVersionCode == 10601004L &&
-                    info.applicationInfo!!.flags and ApplicationInfo.FLAG_SYSTEM != 0 &&
-                    receiver.enabled && receiver.exported && receiver.permission.isNullOrEmpty() &&
-                    signers.size == 1 && MessageDigest.getInstance("SHA-256").digest(signers[0].toByteArray())
+                info.longVersionCode == 10601004L && signers.size == 1 &&
+                    MessageDigest.getInstance("SHA-256").digest(signers[0].toByteArray())
                         .joinToString("") { "%02x".format(it.toInt() and 255) } ==
-                        "efe3ca8ada0d10c655c3df9910ad2ebc121a47d9a6358434eb24074309933efc"
+                    "efe3ca8ada0d10c655c3df9910ad2ebc121a47d9a6358434eb24074309933efc"
             }.getOrDefault(false)
         }
     }

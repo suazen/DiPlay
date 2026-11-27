@@ -98,7 +98,10 @@ object BydNavigationOutputs {
 
     fun start(context: Context) {
         val app = context.applicationContext
-        useStandalone = BydStandaloneHudOutput.available(app)
+        // Head units that ship the DiLink 3 AMap adapter (com.example.amapservice) drive the cluster
+        // through that broadcast protocol and its AutoContainer mode; the standalone receiver packet
+        // format does not apply there, so it must not take over.
+        useStandalone = BydStandaloneHudOutput.available(app) && !usesDiLink3AmapAdapter(app)
         if (useStandalone) standalone.start { BydStandaloneNavigationBridge.initialize(app) }
         else {
             hud.start { BydHudBridge.initialize(app) }
@@ -109,6 +112,11 @@ object BydNavigationOutputs {
         BydClusterSong.attach(app)
         BydCarPlayCall.attach(app)
     }
+
+    private fun usesDiLink3AmapAdapter(app: Context): Boolean =
+        BydAmapAdapter.find { packageName ->
+            runCatching { app.packageManager.getPackageInfo(packageName, 0) }.isSuccess
+        } == BydAmapAdapter.DILINK3
 
     internal fun onFrame(frame: Iap2Frame) {
         if (frame.messageId == ClusterSongState.NOW_PLAYING_UPDATE) {

@@ -59,7 +59,14 @@ internal object BydDiLink3ClusterMode {
         val command: String get() = call(info)
     }
 
-    private fun call(info: Int) = "service call AutoContainer 2 i32 1000 i32 $info s16 \"\""
+    /**
+     * The binder is `AutoContainer` on DiLink 3 and `auto_container` on newer builds such as
+     * Android 12 OCEAN/Di100VCP_IVI. A missing service makes `service call` exit non-zero, so the
+     * second form runs only when the first is not registered.
+     */
+    private fun call(info: Int) =
+        "service call auto_container 2 i32 1000 i32 $info s16 \"\" || " +
+            "service call AutoContainer 2 i32 1000 i32 $info s16 \"\""
 
     /** The mode to request now, or null while DiPlay has never changed the stock mode. */
     fun desired(
@@ -82,7 +89,7 @@ internal object BydDiLink3ClusterMode {
      * the cluster first projects. As DashCast does: full projection, then 35 (Di4.0 mode) creates it; the
      * display then stays after projection off restores the stock view.
      */
-    val CREATE_DISPLAY = listOf(16, 35, 18).map { "service call AutoContainer 2 i32 1000 i32 $it s16 \"\"" }
+    val CREATE_DISPLAY = listOf(16, 35, 18).map(::call)
 }
 
 /** The DiLink 3 adapter shows these preformatted strings, not the numeric distance and time extras. */

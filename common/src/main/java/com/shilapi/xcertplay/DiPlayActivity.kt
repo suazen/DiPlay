@@ -536,6 +536,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
             return
         }
         handler.removeCallbacks(tick); handler.post(tick)
+        refreshCarDayNight()
         // Back with the hotspot access now allowed: the start-up attempt that lacked it runs again.
         if (hotspotStartupResult == CarHotspotTethering.Result.PERMISSION_REQUIRED && CarHotspotTethering.permitted(this)) {
             hotspotStartupResult = null
@@ -7184,6 +7185,17 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         handler.removeCallbacks(appearancePoll)
         handler.post(appearancePoll)
         applyPendingAppearanceRender()
+    }
+
+    /** Read the car's own day/night so this screen follows it even when uiMode never changes. */
+    private fun refreshCarDayNight() {
+        val app = applicationContext
+        Thread({
+            val night = com.shilapi.xcertplay.hud.BydDayNight.refresh(app)
+            if (night != null) runOnUiThread {
+                if (!isFinishing && !isDestroyed) checkForAppearanceChange()
+            }
+        }, "diplay-car-daynight").start()
     }
 
     private fun checkForAppearanceChange() {

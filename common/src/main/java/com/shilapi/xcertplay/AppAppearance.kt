@@ -43,8 +43,10 @@ internal fun Context.resolveAppNightNow(hostNight: Boolean? = AppAppearanceRunti
         appearance = AirPlayPersistence.loadAppAppearance(this),
         carPlayMode = AirPlayPersistence.loadCarPlayNightMode(this),
         schedule = AirPlayPersistence.loadCarPlayNightSchedule(this),
-        systemNight = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
-            Configuration.UI_MODE_NIGHT_YES,
+        // BYD never drives uiMode from the car's day/night, so the shell-read car state wins.
+        systemNight = com.shilapi.xcertplay.hud.BydDayNight.night
+            ?: (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
+                Configuration.UI_MODE_NIGHT_YES),
         minuteOfDay = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE),
         hostNight = hostNight,
     )

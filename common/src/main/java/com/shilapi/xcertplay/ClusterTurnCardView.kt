@@ -16,6 +16,7 @@ import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.airplay.ClusterTurnCardOverlay
 import com.shilapi.xcertplay.hud.ClusterTurnGuidance
+import com.shilapi.xcertplay.iap2.message.LaneGuidanceLane
 
 /**
  * Instruction card drawn by DiPlay on top of the dashboard map.
@@ -26,7 +27,12 @@ import com.shilapi.xcertplay.hud.ClusterTurnGuidance
  * exit number sits in a small badge on the glyph.
  */
 internal class ClusterTurnCardView(context: Context) : View(context) {
+    /** Two visual languages: DiPlay's glass banner and the stock BYD simple-navigation block. */
+    enum class Style { GLASS, BYD_SIMPLE }
+
+    private var style = Style.GLASS
     private var guidance: ClusterTurnGuidance? = null
+    private var lanes: List<LaneGuidanceLane> = emptyList()
     private var night = false
     private var xPercent = ClusterTurnCardOverlay.DEFAULT_X_PERCENT
     private var yPercent = ClusterTurnCardOverlay.DEFAULT_Y_PERCENT
@@ -58,10 +64,22 @@ internal class ClusterTurnCardView(context: Context) : View(context) {
     private val rect = RectF()
     private var glyph: Drawable? = null
     private var glyphTag: Int = -1
+    private val bydPrimary = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+    }
+    private val bydSecondary = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+    }
+    private val bydDivider = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 2f
+    }
+    private var bydGlyph: Drawable? = null
+    private var bydGlyphTag: Int = -1
 
     init { applyPalette() }
 
     fun setLayout(xPercent: Int, yPercent: Int, sizePercent: Int) {
+        if (this.xPercent == xPercent && this.yPercent == yPercent && this.sizePercent == sizePercent) return
         this.xPercent = xPercent
         this.yPercent = yPercent
         this.sizePercent = sizePercent
@@ -85,7 +103,31 @@ internal class ClusterTurnCardView(context: Context) : View(context) {
         invalidate()
     }
 
+    fun setLanes(next: List<LaneGuidanceLane>) {
+        if (lanes == next) return
+        lanes = next
+        invalidate()
+    }
+
+    fun setStyle(next: Style) {
+        if (style == next) return
+        style = next
+        bydGlyphTag = -1
+        applyPalette()
+        invalidate()
+    }
+
     private fun applyPalette() {
+        if (night) {
+            bydPrimary.color = Color.rgb(242, 242, 247)
+            bydSecondary.color = Color.rgb(176, 176, 184)
+            bydDivider.color = Color.argb(72, 255, 255, 255)
+        } else {
+            bydPrimary.color = Color.rgb(17, 17, 17)
+            bydSecondary.color = Color.rgb(107, 107, 107)
+            bydDivider.color = Color.argb(72, 0, 0, 0)
+        }
+        bydGlyphTag = -1
         val alpha = (opacityPercent * 255 / 100).coerceIn(51, 255)
         if (night) {
             glassPaint.color = Color.argb(alpha, 12, 14, 18)
@@ -107,13 +149,16 @@ internal class ClusterTurnCardView(context: Context) : View(context) {
     }
 
     fun setGuidance(next: ClusterTurnGuidance?) {
+        val wasVisible = visibility == VISIBLE
         if (guidance == next) {
             visibility = if (next == null) GONE else VISIBLE
             return
         }
         guidance = next
         visibility = if (next == null) GONE else VISIBLE
-        bringToFront()
+        // Only raising the card when it becomes visible avoids a relayout on every guidance update,
+        // which made the transparent cluster window redraw and appear to flicker.
+        if (next != null && !wasVisible) bringToFront()
         invalidate()
     }
 
@@ -127,6 +172,10 @@ internal class ClusterTurnCardView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val next = guidance ?: return
+        if (style == Style.BYD_SIMPLE) {
+            drawBydSimple(canvas, next)
+            return
+        }
         val card = ClusterTurnCardOverlay.card(width, height, xPercent, yPercent, sizePercent)
         val h = card.height.toFloat()
         val w = card.width.toFloat()
@@ -269,6 +318,110 @@ internal class ClusterTurnCardView(context: Context) : View(context) {
         } else {
             next.road
         }
+
+    /** Stock BYD simple-navigation block: transparent background, large dark glyph, title/road, hairline and trip line. */
+    private fun drawBydSimple(canvas: Canvas, next: ClusterTurnGuidance) {
+        val panelW = width.toFloat()
+        val panelH = height.toFloat()
+        val right = panelW * 0.945f
+        val left = panelW * 0.745f
+        // The trip line and divider keep their panel position; only the maneuver block and lane strip
+        // move up when lanes appear, so the trip line never lands on the lane arrows.
+        val baseCenterY = panelH * 0.450f
+        val centerY = baseCenterY - (if (lanes.isNotEmpty()) panelH * 0.130f else 0f)
+        val arrow = panelH * 0.118f
+        val gap = panelH * 0.070f
+        val titleSize = panelH * 0.076f
+        val roadSize = panelH * 0.034f
+        val infoSize = panelH * 0.039f
+
+        drawBydGlyph(canvas, next, left, centerY - panelH * 0.110f, arrow)
+        val textLeft = left + arrow + gap
+
+        bydPrimary.textSize = titleSize
+        canvas.drawText(distanceLabel(next.distanceMeters), textLeft, centerY - panelH * 0.020f, bydPrimary)
+
+        val road = roadLabel(next)
+        if (road.isNotEmpty()) {
+            bydSecondary.textSize = roadSize
+            canvas.drawText(
+                ellipsize(road, right - textLeft, bydSecondary),
+                textLeft, centerY + panelH * 0.022f, bydSecondary,
+            )
+        }
+
+        val dividerY = baseCenterY + panelH * 0.043f
+        canvas.drawLine(left, dividerY, right, dividerY, bydDivider)
+        if (lanes.isNotEmpty()) drawBydLanes(canvas, dividerY)
+
+        val info = bydInfoLine(next)
+        if (info.isNotEmpty()) {
+            bydPrimary.textSize = infoSize
+            canvas.drawText(info, left, baseCenterY + panelH * 0.100f, bydPrimary)
+        }
+    }
+
+    private fun bydInfoLine(next: ClusterTurnGuidance): String {
+        val parts = mutableListOf<String>()
+        next.remainingMeters?.takeIf { it > 0 }?.let { meters ->
+            parts += if (meters >= 1000) "${meters / 1000} 公里" else "$meters 米"
+        }
+        val eta = next.arrivalEpochSeconds?.takeIf { it > 0 }
+            ?: next.remainingSeconds?.takeIf { it > 0 }?.let { System.currentTimeMillis() / 1000 + it }
+        if (eta != null) {
+            parts += SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(eta * 1000L)) + " 到"
+        }
+        return parts.joinToString("     ")
+    }
+
+    /** One arrow per lane in the strip, above the divider; the recommended lane is DiPlay blue. */
+    private fun drawBydLanes(canvas: Canvas, dividerY: Float) {
+        val panelW = width.toFloat()
+        val panelH = height.toFloat()
+        val side = panelH * 0.078f
+        val gap = panelH * 0.018f
+        val total = lanes.size * side + (lanes.size - 1) * gap
+        val left = panelW * 0.745f
+        val right = panelW * 0.945f
+        val startX = (left + right) / 2f - total / 2f
+        val top = dividerY - panelH * 0.045f - side
+        lanes.forEachIndexed { index, lane ->
+            val tint = if (lane.recommended) accent else bydPrimary.color
+            val arrow = ContextCompat.getDrawable(context, R.drawable.ic_turn_card_straight)
+                ?.mutate()?.apply { setTint(tint) }
+            // The phone sends the lane's own angle plus, for the recommended lane, the direction to
+            // take (90 = right in the captured sample); draw the highlighted direction when present.
+            val angle = if (lane.recommended) lane.highlightAngle ?: lane.angle else lane.angle
+            val x = startX + index * (side + gap)
+            canvas.save()
+            canvas.rotate(angle.toFloat(), x + side / 2f, top + side / 2f)
+            arrow?.setBounds(x.toInt(), top.toInt(), (x + side).toInt(), (top + side).toInt())
+            arrow?.draw(canvas)
+            canvas.restore()
+        }
+    }
+
+    private fun drawBydGlyph(canvas: Canvas, next: ClusterTurnGuidance, left: Float, top: Float, side: Float) {
+        if (next.icon == 0) return
+        val resId = glyphRes(next.icon)
+        if (resId != bydGlyphTag) {
+            bydGlyph = ContextCompat.getDrawable(context, resId)?.mutate()?.apply { setTint(bydPrimary.color) }
+            bydGlyphTag = resId
+        }
+        bydGlyph?.setBounds(left.toInt(), top.toInt(), (left + side).toInt(), (top + side).toInt())
+        bydGlyph?.draw(canvas)
+        val exit = next.roundaboutExit.takeIf { it in 1..9 }
+        if (exit != null) {
+            val d = side * 0.42f
+            val cx = left + side - d / 2f
+            val cy = top + side - d / 2f
+            badgePaint.color = bydPrimary.color
+            canvas.drawCircle(cx, cy, d / 2f, badgePaint)
+            canvas.drawText(exit.toString(), cx,
+                cy - (badgeTextPaint.descent() + badgeTextPaint.ascent()) / 2f,
+                badgeTextPaint.apply { color = if (night) Color.rgb(17, 17, 17) else Color.WHITE; textSize = d * 0.62f })
+        }
+    }
 
     private fun ellipsize(text: String, maxWidth: Float, paint: Paint): String {
         if (paint.measureText(text) <= maxWidth) return text
